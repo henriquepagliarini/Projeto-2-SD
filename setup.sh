@@ -8,6 +8,7 @@ echo "Instalando dependências..."
 pip install Pyro5
 
 source venv/bin/activate
-python -m Pyro5.nameserver
-
 echo "Ambiente configurado!"
+
+echo "Iniciando o Name Server do Pyro5..."
+python -m Pyro5.nameserver
