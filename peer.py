@@ -15,6 +15,12 @@ class Peer:
         self.name = name
         self.state = State.RELEASED
 
+        self.replies_received = 0
+        self.deferred_replies = []
+
+        self.lock = threading.Lock()
+        self.request_event = threading.Event()
+
     def hello(self):
         return f"Hi from {self.name}"
     
@@ -28,7 +34,7 @@ class Peer:
             print(f"Erro ao consultar nameserver: {e}")
         return []
     
-    def _get_peers_count(self):
+    def get_peers_count(self):
         active_peers = self.get_active_peers()
         return len([p for p in active_peers if p != self.name])
     
@@ -43,6 +49,69 @@ class Peer:
                 except Exception as e:
                     print(f"{peer_name} não está respondendo: {e}")
 
+    def request_resource(self, peer_name):
+        with self.lock:
+            print(f"Requisição recebida de {peer_name}.")
+
+            if self.state == State.HELD: # Fazer comparação de timestamp e id quando 'WANTED'
+                # Resposta adiada
+                print(f"Adiando resposta para {peer_name}.")
+                self.deferred_replies.append(peer_name)
+                return False
+            else:
+                # Resposta imediata
+                print(f"Respondendo imediatamente para {peer_name}.")
+                return True
+
+    def enter_critical_section(self):
+        with self.lock:
+            if self.state == State.HELD:
+                print(f"{self.name} já está na seção crítica.")
+                return True
+
+            self.state = State.WANTED
+            self.replies_received = 0
+            self.request_event.clear()
+
+        print(f"Solicitando recurso...")
+
+        request_threads = []
+        for peer_name in self.get_active_peers():
+            if peer_name != self.name:
+                thread = threading.Thread(
+                    target=self.send_request_notification, 
+                    args=(peer_name,)
+                )
+                thread.daemon = True
+                request_threads.append(thread)
+                thread.start()
+
+        print(f"Aguardando respostas...")
+        self.request_event.wait(timeout=10)
+
+        with self.lock:
+            if self.replies_received >= self.get_peers_count():
+                self.state = State.HELD
+                print(f"Entrou na seção crítica.")
+                return True
+            else:
+                self.state = State.RELEASED
+                print(f"Não conseguiu entrar na seção crítica.")
+                return False
+
+    def send_request_notification(self, peer_name):
+        try:
+            with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                if peer.request_resource(self.name):
+                    with self.lock:
+                        self.replies_received += 1
+                        print(f"Resposta imediata de {peer_name} ({self.replies_received}/{self.get_peers_count()})")
+
+                        if self.replies_received >= self.get_peers_count():
+                            self.request_event.set()
+        except Exception as e:
+            print(f"Erro ao requisitar {peer_name}: {e}")
+
 def start_peer(name):
     peer = Peer(name)
 
@@ -50,7 +119,7 @@ def start_peer(name):
     daemon = Pyro5.api.Daemon()
     uri = daemon.register(peer)
     ns = Pyro5.api.locate_ns()
-    ns.register(name, uri)
+    ns.register(name, uri, safe=True)
     print(f"Peer '{name}' iniciado e registrado!")
 
     threading.Thread(target=daemon.requestLoop, daemon=True).start()
@@ -62,12 +131,14 @@ def start_peer(name):
         print("3. Listar peers ativos")
         print("4. Sair")
 
-        option = input("Escolha uma ação: ").strip()
+        option = input("Escolha uma ação: ")
 
         match option:
             case '1':
-                # Implementar requisição de recurso
-                print("Requisitando recurso...")
+                if peer.enter_critical_section():
+                    print(f"{name} está acessando o recurso...")
+                else:
+                    print(f"{name} não conseguiu acessar o recurso.")
             case '2':
                 # Implementar liberação de recurso
                 print("Saindo do recurso...")
@@ -77,6 +148,7 @@ def start_peer(name):
                 peer.test_connection()
             case '4':
                 print("Saindo...")
+                ns.remove(name)
                 break
             case _:
                 print("Opção inválida! (1 a 4)")
