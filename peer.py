@@ -63,6 +63,14 @@ class Peer:
                 print(f"Respondendo imediatamente para {peer_name}.")
                 return True
 
+    def receive_reply(self, peer_name):
+        with self.lock:
+            self.replies_received += 1
+            print(f"Resposta de {peer_name} recebida ({self.replies_received}/{self.get_peers_count()})")
+
+            if self.replies_received >= self.get_peers_count():
+                self.request_event.set()
+
     def enter_critical_section(self):
         with self.lock:
             if self.state == State.HELD:
@@ -103,14 +111,30 @@ class Peer:
         try:
             with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
                 if peer.request_resource(self.name):
-                    with self.lock:
-                        self.replies_received += 1
-                        print(f"Resposta imediata de {peer_name} ({self.replies_received}/{self.get_peers_count()})")
-
-                        if self.replies_received >= self.get_peers_count():
-                            self.request_event.set()
+                    self.receive_reply(peer_name)
         except Exception as e:
             print(f"Erro ao requisitar {peer_name}: {e}")
+
+    def exit_critical_section(self):
+        with self.lock:
+            if self.state != State.HELD:
+                print(f"{self.name} não está na seção crítica.")
+                return False
+            
+            self.state = State.RELEASED
+            print(f"{self.name} saiu da seção crítica")
+            
+            # Notificar outros peers
+            for peer_name in self.deferred_replies:
+                try:
+                    with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                        peer.receive_reply(self.name)
+                        print(f"Enviou resposta adiada para {peer_name}")
+                except Exception as e:
+                    print(f"Erro ao enviar resposta para {peer_name}: {e}")
+
+            self.deferred_replies.clear()
+            return True
 
 def start_peer(name):
     peer = Peer(name)
@@ -140,8 +164,10 @@ def start_peer(name):
                 else:
                     print(f"{name} não conseguiu acessar o recurso.")
             case '2':
-                # Implementar liberação de recurso
-                print("Saindo do recurso...")
+                if peer.exit_critical_section():
+                    print(f"{name} liberou o recurso.")
+                else:
+                    print(f"{name} não conseguiu liberar o recurso.")
             case '3':
                 print(f"Peers ativos:\n{peer.get_active_peers()}")
                 print(f"Testando conectividade...")
