@@ -1,10 +1,11 @@
 from enum import Enum
-import subprocess
 import sys
 import threading
 import time
 
 import Pyro5.api
+
+import nameserver
 
 class State(Enum):
     RELEASED = 0
@@ -216,25 +217,8 @@ class Peer:
                 self.send_release_notification()
             return True
 
-def start_nameserver():
-    try:
-        ns = Pyro5.api.locate_ns()
-        print("Servidor de nomes Pyro encontrado.")
-        return ns
-    except Pyro5.errors.NamingError:
-        print("Servidor de nomes Pyro não encontrado. Criando subprocesso...")
-        subprocess.Popen(
-            ["python", "-m", "Pyro5.nameserver"], 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
-        time.sleep(3)
-        ns = Pyro5.api.locate_ns()
-        print("Servidor de nomes Pyro criado.")
-        return ns
-
 def start_peer(name):
-    ns = start_nameserver()
+    ns = nameserver.start_nameserver()
 
     peer = Peer(name)
     # Registra o peer no servidor
@@ -275,21 +259,11 @@ def start_peer(name):
                 print("Saindo...")
                 ns.remove(name)
 
-                try:
-                    peers = peer.get_active_peers()
-                    print(f"Peers restantes: {peers}")
+                peers = peer.get_active_peers()
+                print(f"Peers restantes: {peers}")
 
-                    if not peers:
-                        print("Encerrando o servidor de nomes...")
-                        subprocess.run(
-                            ["pkill", "-f", "Pyro5.nameserver"],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
-                        )
-                        print("Servidor de nomes encerrado com sucesso.")
-                except Exception as e:
-                    print(f"Erro ao encerrar o servidor de nomes: {e}")
-
+                if not peers:
+                    nameserver.kill_nameserver()
                 break
             case _:
                 print("Opção inválida! (1 a 4)")
