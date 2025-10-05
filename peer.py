@@ -15,7 +15,8 @@ class Peer:
         self.name = name
         self.state = State.RELEASED
         self.timestamp = 0
-        
+        self.request_timestamp = None
+
         self.replies_received = 0
         self.deferred_replies = []
 
@@ -27,65 +28,81 @@ class Peer:
 
     def get_active_peers(self):
         try:
-            ns = Pyro5.api.locate_ns()
-            peers = ns.list(prefix="Peer")
-            active_peers = list(peers.keys())
+            with Pyro5.api.locate_ns() as ns:
+                peers = ns.list(prefix="Peer")
+                active_peers = [p for p in peers if p != self.name]
             return active_peers
         except Exception as e:
             print(f"[{self.name}]: Erro ao consultar nameserver: {e}")
         return []
 
     def get_peers_count(self):
-        active_peers = self.get_active_peers()
-        return len([p for p in active_peers if p != self.name])
+        return len(self.get_active_peers())
 
     def test_connection(self):
         active_peers = self.get_active_peers()
         for peer_name in active_peers:
-            if peer_name != self.name:
-                try:
-                    with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
-                        response = peer.hello()
-                        print(f"[{self.name}]: {response}")
-                except Exception as e:
-                    print(f"[{self.name}]: {peer_name} não respondeu: {e}")
+            try:
+                with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                    response = peer.hello()
+                    print(f"[{self.name}]: {response}")
+            except Exception as e:
+                print(f"[{self.name}]: {peer_name} não respondeu: {e}")
 
     def increment_timestamp(self):
         self.timestamp += 1
         return self.timestamp
 
-    def update_timestamp(self, requester_timestamp):
-        self.timestamp = max(self.timestamp, requester_timestamp) + 1
-        return self.timestamp
+    def update_timestamp(self, request_timestamp):
+        self.timestamp = max(self.timestamp, request_timestamp) + 1
 
-    def has_priority(self, requester_timestamp, requester_peer_name):
-        if self.timestamp < requester_timestamp:
+    def has_priority(self, local_timestamp, requester_timestamp, requester_peer_name):
+        if local_timestamp < requester_timestamp:
             return True
-        if self.timestamp == requester_timestamp:
-            if self.name < requester_peer_name:
-                return True
+        if local_timestamp == requester_timestamp and self.name < requester_peer_name:
+            return True
         return False
 
     def request_resource(self, requester_timestamp, requester_peer_name):
         with self.lock:
             print(f"\n[{self.name}]: Requisição recebida - ({requester_peer_name}, {requester_timestamp})")
-            allow = True
-            if self.state == State.HELD or (self.state == State.WANTED and self.has_priority(requester_timestamp, requester_peer_name)):
-                allow = False
+            denied = self.state == State.HELD or (self.state == State.WANTED and self.has_priority(self.request_timestamp, requester_timestamp, requester_peer_name))
+            self.update_timestamp(requester_timestamp)
+
+            if denied:
                 self.deferred_replies.append(requester_peer_name)
                 print(f"[{self.name}]: Resposta de {requester_peer_name} adiada.")
+                return False
             else:
                 print(f"[{self.name}]: Respondendo {requester_peer_name} imediatamente.")
-            self.update_timestamp(requester_timestamp)
-            return allow
+                return True
 
     def receive_reply(self, receiving_from_peer_name):
         with self.lock:
-            self.replies_received += 1
-            print(f"[{self.name}]: Resposta de {receiving_from_peer_name} recebida ({self.replies_received}/{self.get_peers_count()})")
+            if self.state == State.WANTED:
+                self.replies_received += 1
+                print(f"[{self.name}]: Resposta de {receiving_from_peer_name} recebida ({self.replies_received}/{self.get_peers_count()})")
 
-            if self.replies_received == self.get_peers_count():
-                self.request_event.set()
+                if self.replies_received >= self.get_peers_count():
+                    self.request_event.set()
+
+    def send_request_notification(self, request_timestamp, active_peer_name):
+        try:
+            with Pyro5.api.Proxy(f"PYRONAME:{active_peer_name}") as peer:
+                if peer.request_resource(request_timestamp, self.name):
+                    self.receive_reply(active_peer_name)
+        except Exception as e:
+            print(f"[{self.name}]: Erro ao requisitar {active_peer_name}: {e}")
+
+    def send_release_notification(self):
+        for peer_name in self.deferred_replies:
+            try:
+                with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                    peer.receive_reply(self.name)
+                    print(f"[{self.name}]: Enviou resposta adiada para {peer_name}")
+            except Exception as e:
+                print(f"[{self.name}]: Erro ao enviar resposta adiada para {peer_name}: {e}")
+        self.deferred_replies.clear()
 
     def enter_critical_section(self):
         with self.lock:
@@ -96,39 +113,36 @@ class Peer:
             self.state = State.WANTED
             self.replies_received = 0
             self.request_event.clear()
-            request_timestamp  = self.increment_timestamp()
+            self.request_timestamp  = self.increment_timestamp()
 
         print(f"\n[{self.name}]: Solicitando recurso...")
 
+        active_peers = self.get_active_peers()
         request_threads = []
-        for active_peer_name in self.get_active_peers():
+        for active_peer_name in active_peers:
             if active_peer_name != self.name:
                 thread = threading.Thread(
                     target=self.send_request_notification, 
-                    args=(request_timestamp, active_peer_name,)
+                    args=(self.request_timestamp, active_peer_name,)
                 )
                 thread.daemon = True
                 request_threads.append(thread)
                 thread.start()
 
-        print(f"[{self.name}]: Aguardando respostas...")
+        print(f"[{self.name}]: Aguardando {self.get_peers_count()} respostas...")
         self.request_event.wait(timeout=10)
 
         with self.lock:
             if self.replies_received >= self.get_peers_count():
                 self.state = State.HELD
+                self.request_timestamp = None
                 return True
             else:
+                print(f"[{self.name}]: Timeout ao obter todas as respostas. Liberando peers em espera.")
                 self.state = State.RELEASED
+                self.send_release_notification()
+                self.request_timestamp = None
                 return False
-
-    def send_request_notification(self, request_timestamp, active_peer_name):
-        try:
-            with Pyro5.api.Proxy(f"PYRONAME:{active_peer_name}") as peer:
-                if peer.request_resource(request_timestamp, self.name):
-                    self.receive_reply(active_peer_name)
-        except Exception as e:
-            print(f"[{self.name}]: Erro ao requisitar {active_peer_name}: {e}")
 
     def exit_critical_section(self):
         with self.lock:
@@ -136,17 +150,9 @@ class Peer:
                 print(f"\n[{self.name}]: Não está na seção crítica.")
                 return False
             
+            print(f"[{self.name}]: Liberando recurso...")
             self.state = State.RELEASED
-            
-            # Notificar outros peers
-            for peer_name in self.deferred_replies:
-                try:
-                    with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
-                        peer.receive_reply(self.name)
-                        print(f"[{self.name}]: Enviou resposta adiada para {peer_name}")
-                except Exception as e:
-                    print(f"[{self.name}]: Erro ao enviar resposta adiada para {peer_name}: {e}")
-            self.deferred_replies.clear()
+            self.send_release_notification()
             return True
 
 def start_peer(name):
