@@ -14,7 +14,8 @@ class Peer:
     def __init__(self, name):
         self.name = name
         self.state = State.RELEASED
-
+        self.timestamp = 0
+        
         self.replies_received = 0
         self.deferred_replies = []
 
@@ -23,7 +24,7 @@ class Peer:
 
     def hello(self):
         return f"Hi from {self.name}"
-    
+
     def get_active_peers(self):
         try:
             ns = Pyro5.api.locate_ns()
@@ -31,13 +32,13 @@ class Peer:
             active_peers = list(peers.keys())
             return active_peers
         except Exception as e:
-            print(f"Erro ao consultar nameserver: {e}")
+            print(f"[{self.name}]: Erro ao consultar nameserver: {e}")
         return []
-    
+
     def get_peers_count(self):
         active_peers = self.get_active_peers()
         return len([p for p in active_peers if p != self.name])
-    
+
     def test_connection(self):
         active_peers = self.get_active_peers()
         for peer_name in active_peers:
@@ -45,94 +46,106 @@ class Peer:
                 try:
                     with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
                         response = peer.hello()
-                        print(f"{peer_name} está respondendo: {response}")
+                        print(f"[{self.name}]: {response}")
                 except Exception as e:
-                    print(f"{peer_name} não está respondendo: {e}")
+                    print(f"[{self.name}]: {peer_name} não respondeu: {e}")
 
-    def request_resource(self, peer_name):
-        with self.lock:
-            print(f"Requisição recebida de {peer_name}.")
+    def increment_timestamp(self):
+        self.timestamp += 1
+        return self.timestamp
 
-            if self.state == State.HELD: # Fazer comparação de timestamp e id quando 'WANTED'
-                # Resposta adiada
-                print(f"Adiando resposta para {peer_name}.")
-                self.deferred_replies.append(peer_name)
-                return False
-            else:
-                # Resposta imediata
-                print(f"Respondendo imediatamente para {peer_name}.")
+    def update_timestamp(self, requester_timestamp):
+        self.timestamp = max(self.timestamp, requester_timestamp) + 1
+        return self.timestamp
+
+    def has_priority(self, requester_timestamp, requester_peer_name):
+        if self.timestamp < requester_timestamp:
+            return True
+        if self.timestamp == requester_timestamp:
+            if self.name < requester_peer_name:
                 return True
+        return False
 
-    def receive_reply(self, peer_name):
+    def request_resource(self, requester_timestamp, requester_peer_name):
+        with self.lock:
+            print(f"\n[{self.name}]: Requisição recebida - ({requester_peer_name}, {requester_timestamp})")
+            allow = True
+            if self.state == State.HELD or (self.state == State.WANTED and self.has_priority(requester_timestamp, requester_peer_name)):
+                allow = False
+                self.deferred_replies.append(requester_peer_name)
+                print(f"[{self.name}]: Resposta de {requester_peer_name} adiada.")
+            else:
+                print(f"[{self.name}]: Respondendo {requester_peer_name} imediatamente.")
+            self.update_timestamp(requester_timestamp)
+            return allow
+
+    def receive_reply(self, receiving_from_peer_name):
         with self.lock:
             self.replies_received += 1
-            print(f"Resposta de {peer_name} recebida ({self.replies_received}/{self.get_peers_count()})")
+            print(f"[{self.name}]: Resposta de {receiving_from_peer_name} recebida ({self.replies_received}/{self.get_peers_count()})")
 
-            if self.replies_received >= self.get_peers_count():
+            if self.replies_received == self.get_peers_count():
                 self.request_event.set()
 
     def enter_critical_section(self):
         with self.lock:
             if self.state == State.HELD:
-                print(f"{self.name} já está na seção crítica.")
+                print(f"[{self.name}]: Já está na seção crítica.")
                 return True
 
             self.state = State.WANTED
             self.replies_received = 0
             self.request_event.clear()
+            request_timestamp  = self.increment_timestamp()
 
-        print(f"Solicitando recurso...")
+        print(f"\n[{self.name}]: Solicitando recurso...")
 
         request_threads = []
-        for peer_name in self.get_active_peers():
-            if peer_name != self.name:
+        for active_peer_name in self.get_active_peers():
+            if active_peer_name != self.name:
                 thread = threading.Thread(
                     target=self.send_request_notification, 
-                    args=(peer_name,)
+                    args=(request_timestamp, active_peer_name,)
                 )
                 thread.daemon = True
                 request_threads.append(thread)
                 thread.start()
 
-        print(f"Aguardando respostas...")
+        print(f"[{self.name}]: Aguardando respostas...")
         self.request_event.wait(timeout=10)
 
         with self.lock:
             if self.replies_received >= self.get_peers_count():
                 self.state = State.HELD
-                print(f"Entrou na seção crítica.")
                 return True
             else:
                 self.state = State.RELEASED
-                print(f"Não conseguiu entrar na seção crítica.")
                 return False
 
-    def send_request_notification(self, peer_name):
+    def send_request_notification(self, request_timestamp, active_peer_name):
         try:
-            with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
-                if peer.request_resource(self.name):
-                    self.receive_reply(peer_name)
+            with Pyro5.api.Proxy(f"PYRONAME:{active_peer_name}") as peer:
+                if peer.request_resource(request_timestamp, self.name):
+                    self.receive_reply(active_peer_name)
         except Exception as e:
-            print(f"Erro ao requisitar {peer_name}: {e}")
+            print(f"[{self.name}]: Erro ao requisitar {active_peer_name}: {e}")
 
     def exit_critical_section(self):
         with self.lock:
             if self.state != State.HELD:
-                print(f"{self.name} não está na seção crítica.")
+                print(f"\n[{self.name}]: Não está na seção crítica.")
                 return False
             
             self.state = State.RELEASED
-            print(f"{self.name} saiu da seção crítica")
             
             # Notificar outros peers
             for peer_name in self.deferred_replies:
                 try:
                     with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
                         peer.receive_reply(self.name)
-                        print(f"Enviou resposta adiada para {peer_name}")
+                        print(f"[{self.name}]: Enviou resposta adiada para {peer_name}")
                 except Exception as e:
-                    print(f"Erro ao enviar resposta para {peer_name}: {e}")
-
+                    print(f"[{self.name}]: Erro ao enviar resposta adiada para {peer_name}: {e}")
             self.deferred_replies.clear()
             return True
 
@@ -149,7 +162,7 @@ def start_peer(name):
     threading.Thread(target=daemon.requestLoop, daemon=True).start()
 
     while True:
-        print(f"---> {name}:")
+        print(f"\n---> {name}:")
         print("1. Requisitar recurso")
         print("2. Liberar recurso")
         print("3. Listar peers ativos")
@@ -160,16 +173,16 @@ def start_peer(name):
         match option:
             case '1':
                 if peer.enter_critical_section():
-                    print(f"{name} está acessando o recurso...")
+                    print(f"[{name}]: Entrou na seção crítica.")
                 else:
-                    print(f"{name} não conseguiu acessar o recurso.")
+                    print(f"[{name}]: Não conseguiu entrar na seção crítica.")
             case '2':
                 if peer.exit_critical_section():
-                    print(f"{name} liberou o recurso.")
+                    print(f"[{name}]: Saiu da seção crítica.")
                 else:
-                    print(f"{name} não conseguiu liberar o recurso.")
+                    print(f"[{name}]: Não conseguiu sair da seção crítica.")
             case '3':
-                print(f"Peers ativos:\n{peer.get_active_peers()}")
+                print(f"\nPeers ativos:\n{peer.get_active_peers()}")
                 print(f"Testando conectividade...")
                 peer.test_connection()
             case '4':
