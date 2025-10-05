@@ -5,6 +5,7 @@ import time
 
 import Pyro5.api
 
+import heartbeat
 import nameserver
 
 class State(Enum):
@@ -32,8 +33,6 @@ class Peer:
         # Todos em segundos
         self.MAX_WAIT_TIME = 15
         self.MAX_ACCESS_TIME = 8
-        self.HEARTBEAT_INTERVAL = 3
-        self.HEARTBEAT_TIMEOUT = 5
 
     def hello(self):
         return f"Hi from {self.name}"
@@ -77,35 +76,9 @@ class Peer:
             except Exception:
                 pass
 
-    def send_heartbeat(self):
-        while True:
-            self.check_registered_peers()
-            with self.heartbeat_lock:
-                for peer_name in list(self.active_peers.keys()):
-                    try:
-                        with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
-                            peer.receive_heartbeat(self.name)
-                    except Exception as e:
-                        print(f"[{self.name}]: Erro ao enviar heartbeat para {peer_name}: {e}")
-            time.sleep(self.HEARTBEAT_INTERVAL)
-
     def receive_heartbeat(self, receiving_from_peer_name):
         with self.heartbeat_lock:
             self.active_peers[receiving_from_peer_name] = time.time()
-
-    def heartbeat_monitor(self):
-        while True:
-            now = time.time()
-            with self.heartbeat_lock:
-                for peer_name, last_heartbeat in set(self.active_peers.items()):
-                    if now - last_heartbeat > self.HEARTBEAT_TIMEOUT:
-                        print(f"\n[{self.name}]: Peer {peer_name} parece inativo. Removendo...")
-                        del self.active_peers[peer_name]
-                        with self.lock:
-                            if peer_name in self.deferred_replies:
-                                self.deferred_replies.remove(peer_name)
-                        print(f"[{self.name}]: Peer {peer_name} removido.")
-            time.sleep(2)
 
     def increment_timestamp(self):
         self.timestamp += 1
@@ -229,8 +202,7 @@ def start_peer(name):
     threading.Thread(target=daemon.requestLoop, daemon=True).start()
 
     # Iniciando heartbeat para detecção de falhas nos processos
-    threading.Thread(target=peer.send_heartbeat, daemon=True).start()
-    threading.Thread(target=peer.heartbeat_monitor, daemon=True).start()
+    heartbeat.start_heartbeat(peer)
 
     while True:
         print(f"\n---> {name}:")
