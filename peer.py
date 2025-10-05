@@ -18,29 +18,37 @@ class Peer:
         self.state = State.RELEASED
         self.timestamp = 0
         self.request_timestamp = None
-
+        
+        self.registered_peers = []
+        self.active_peers = {}
         self.replies_received = 0
         self.deferred_replies = []
 
         self.lock = threading.Lock()
+        self.heartbeat_lock = threading.Lock()
         self.request_event = threading.Event()
 
         # Todos em segundos
-        self.MAX_WAIT_TIME = 10
-        self.MAX_ACCESS_TIME = 6
+        self.MAX_WAIT_TIME = 15
+        self.MAX_ACCESS_TIME = 8
+        self.HEARTBEAT_INTERVAL = 3
+        self.HEARTBEAT_TIMEOUT = 5
 
     def hello(self):
         return f"Hi from {self.name}"
 
-    def get_active_peers(self):
+    def get_registered_peers(self):
         try:
             with Pyro5.api.locate_ns() as ns:
                 peers = ns.list(prefix="Peer")
-                active_peers = [p for p in peers if p != self.name]
-            return active_peers
+                return [p for p in peers if p != self.name]
         except Exception as e:
             print(f"[{self.name}]: Erro ao consultar nameserver: {e}")
         return []
+
+    def get_active_peers(self):
+        with self.heartbeat_lock:
+            return list(self.active_peers.keys())
 
     def get_peers_count(self):
         return len(self.get_active_peers())
@@ -54,6 +62,49 @@ class Peer:
                     print(f"[{self.name}]: {response}")
             except Exception as e:
                 print(f"[{self.name}]: {peer_name} não respondeu: {e}")
+
+    def check_registered_peers(self):
+        registered_peers = self.get_registered_peers()
+        for peer_name in registered_peers:
+            try:
+                with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                    if peer.hello():
+                        with self.heartbeat_lock:
+                            if peer_name not in self.active_peers:
+                                self.active_peers[peer_name] = time.time()
+                                print(f"\n[{self.name}]: Peer {peer_name} adicionado aos ativos.")
+            except Exception:
+                pass
+
+    def send_heartbeat(self):
+        while True:
+            self.check_registered_peers()
+            with self.heartbeat_lock:
+                for peer_name in list(self.active_peers.keys()):
+                    try:
+                        with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as peer:
+                            peer.receive_heartbeat(self.name)
+                    except Exception as e:
+                        print(f"[{self.name}]: Erro ao enviar heartbeat para {peer_name}: {e}")
+            time.sleep(self.HEARTBEAT_INTERVAL)
+
+    def receive_heartbeat(self, receiving_from_peer_name):
+        with self.heartbeat_lock:
+            self.active_peers[receiving_from_peer_name] = time.time()
+
+    def heartbeat_monitor(self):
+        while True:
+            now = time.time()
+            with self.heartbeat_lock:
+                for peer_name, last_heartbeat in set(self.active_peers.items()):
+                    if now - last_heartbeat > self.HEARTBEAT_TIMEOUT:
+                        print(f"\n[{self.name}]: Peer {peer_name} parece inativo. Removendo...")
+                        del self.active_peers[peer_name]
+                        with self.lock:
+                            if peer_name in self.deferred_replies:
+                                self.deferred_replies.remove(peer_name)
+                        print(f"[{self.name}]: Peer {peer_name} removido.")
+            time.sleep(2)
 
     def increment_timestamp(self):
         self.timestamp += 1
@@ -124,7 +175,6 @@ class Peer:
         print(f"\n[{self.name}]: Solicitando recurso...")
 
         active_peers = self.get_active_peers()
-        request_threads = []
         for active_peer_name in active_peers:
             if active_peer_name != self.name:
                 thread = threading.Thread(
@@ -132,7 +182,6 @@ class Peer:
                     args=(self.request_timestamp, active_peer_name,)
                 )
                 thread.daemon = True
-                request_threads.append(thread)
                 thread.start()
 
         print(f"[{self.name}]: Aguardando {self.get_peers_count()} respostas...")
@@ -150,7 +199,8 @@ class Peer:
             else:
                 print(f"[{self.name}]: Timeout ao obter todas as respostas. Liberando peers em espera.")
                 self.state = State.RELEASED
-                self.send_release_notification()
+                if self.deferred_replies:
+                    self.send_release_notification()
                 self.request_timestamp = None
                 return False
 
@@ -162,7 +212,8 @@ class Peer:
             
             print(f"\n[{self.name}]: Liberando recurso...")
             self.state = State.RELEASED
-            self.send_release_notification()
+            if self.deferred_replies:
+                self.send_release_notification()
             return True
 
 def start_nameserver():
@@ -172,8 +223,12 @@ def start_nameserver():
         return ns
     except Pyro5.errors.NamingError:
         print("Servidor de nomes Pyro não encontrado. Criando subprocesso...")
-        subprocess.Popen(["python", "-m", "Pyro5.nameserver"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
+        subprocess.Popen(
+            ["python", "-m", "Pyro5.nameserver"], 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(3)
         ns = Pyro5.api.locate_ns()
         print("Servidor de nomes Pyro criado.")
         return ns
@@ -188,6 +243,10 @@ def start_peer(name):
     ns.register(name, uri, safe=True)
     print(f"Peer '{name}' iniciado e registrado!")
     threading.Thread(target=daemon.requestLoop, daemon=True).start()
+
+    # Iniciando heartbeat para detecção de falhas nos processos
+    threading.Thread(target=peer.send_heartbeat, daemon=True).start()
+    threading.Thread(target=peer.heartbeat_monitor, daemon=True).start()
 
     while True:
         print(f"\n---> {name}:")
@@ -215,6 +274,22 @@ def start_peer(name):
             case '4':
                 print("Saindo...")
                 ns.remove(name)
+
+                try:
+                    peers = peer.get_active_peers()
+                    print(f"Peers restantes: {peers}")
+
+                    if not peers:
+                        print("Encerrando o servidor de nomes...")
+                        subprocess.run(
+                            ["pkill", "-f", "Pyro5.nameserver"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        print("Servidor de nomes encerrado com sucesso.")
+                except Exception as e:
+                    print(f"Erro ao encerrar o servidor de nomes: {e}")
+
                 break
             case _:
                 print("Opção inválida! (1 a 4)")
