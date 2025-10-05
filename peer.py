@@ -1,4 +1,5 @@
 from enum import Enum
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +24,10 @@ class Peer:
 
         self.lock = threading.Lock()
         self.request_event = threading.Event()
+
+        # Todos em segundos
+        self.MAX_WAIT_TIME = 10
+        self.MAX_ACCESS_TIME = 6
 
     def hello(self):
         return f"Hi from {self.name}"
@@ -131,12 +136,16 @@ class Peer:
                 thread.start()
 
         print(f"[{self.name}]: Aguardando {self.get_peers_count()} respostas...")
-        self.request_event.wait(timeout=10)
+        self.request_event.wait(timeout=self.MAX_WAIT_TIME)
 
         with self.lock:
             if self.replies_received >= self.get_peers_count():
                 self.state = State.HELD
                 self.request_timestamp = None
+
+                timer = threading.Timer(self.MAX_ACCESS_TIME, self.exit_critical_section)
+                timer.daemon = True
+                timer.start()
                 return True
             else:
                 print(f"[{self.name}]: Timeout ao obter todas as respostas. Liberando peers em espera.")
@@ -151,24 +160,26 @@ class Peer:
                 print(f"\n[{self.name}]: Não está na seção crítica.")
                 return False
             
-            print(f"[{self.name}]: Liberando recurso...")
+            print(f"\n[{self.name}]: Liberando recurso...")
             self.state = State.RELEASED
             self.send_release_notification()
             return True
 
 def start_nameserver():
     try:
-        Pyro5.api.locate_ns()
+        ns = Pyro5.api.locate_ns()
         print("Servidor de nomes Pyro encontrado.")
+        return ns
     except Pyro5.errors.NamingError:
-        print("Servidor de nomes Pyro não encontrado. Criando...")
-        Pyro5.nameserver.start_ns_loop(host="localhost")
+        print("Servidor de nomes Pyro não encontrado. Criando subprocesso...")
+        subprocess.Popen(["python", "-m", "Pyro5.nameserver"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        ns = Pyro5.api.locate_ns()
         print("Servidor de nomes Pyro criado.")
+        return ns
 
 def start_peer(name):
-    threading.Thread(target=start_nameserver, daemon=True).start()
-    time.sleep(3)
-    ns = Pyro5.api.locate_ns()
+    ns = start_nameserver()
 
     peer = Peer(name)
     # Registra o peer no servidor
