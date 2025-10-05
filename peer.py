@@ -1,6 +1,7 @@
 from enum import Enum
 import sys
 import threading
+import time
 
 import Pyro5.api
 
@@ -155,16 +156,26 @@ class Peer:
             self.send_release_notification()
             return True
 
-def start_peer(name):
-    peer = Peer(name)
+def start_nameserver():
+    try:
+        Pyro5.api.locate_ns()
+        print("Servidor de nomes Pyro encontrado.")
+    except Pyro5.errors.NamingError:
+        print("Servidor de nomes Pyro não encontrado. Criando...")
+        Pyro5.nameserver.start_ns_loop(host="localhost")
+        print("Servidor de nomes Pyro criado.")
 
+def start_peer(name):
+    threading.Thread(target=start_nameserver, daemon=True).start()
+    time.sleep(3)
+    ns = Pyro5.api.locate_ns()
+
+    peer = Peer(name)
     # Registra o peer no servidor
     daemon = Pyro5.api.Daemon()
     uri = daemon.register(peer)
-    ns = Pyro5.api.locate_ns()
     ns.register(name, uri, safe=True)
     print(f"Peer '{name}' iniciado e registrado!")
-
     threading.Thread(target=daemon.requestLoop, daemon=True).start()
 
     while True:
@@ -173,7 +184,6 @@ def start_peer(name):
         print("2. Liberar recurso")
         print("3. Listar peers ativos")
         print("4. Sair")
-
         option = input("Escolha uma ação: ")
 
         match option:
@@ -197,7 +207,6 @@ def start_peer(name):
                 break
             case _:
                 print("Opção inválida! (1 a 4)")
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
