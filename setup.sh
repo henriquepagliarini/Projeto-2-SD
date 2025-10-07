@@ -7,5 +7,4 @@ source venv/bin/activate
 echo "Instalando dependências..."
 pip install Pyro5
 
-source venv/bin/activate
 echo "Ambiente configurado!"
