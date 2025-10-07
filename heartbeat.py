@@ -12,7 +12,7 @@ def send_heartbeat(peer):
     while True:
         peer.check_registered_peers()
         with peer.heartbeat_lock:
-            for peer_name in list(peer.active_peers.keys()):
+            for peer_name in peer.active_peers:
                 try:
                     with Pyro5.api.Proxy(f"PYRONAME:{peer_name}") as other_peer:
                         other_peer.receive_heartbeat(peer.name)
@@ -24,7 +24,8 @@ def heartbeat_monitor(peer):
     while True:
         now = time.time()
         with peer.heartbeat_lock:
-            for peer_name, last_heartbeat in set(peer.active_peers.items()):
+            for peer_name in list(peer.active_peers.keys()):
+                last_heartbeat = peer.active_peers[peer_name]
                 if now - last_heartbeat > HEARTBEAT_TIMEOUT:
                     utils.log(peer.name, f"Peer {peer_name} parece inativo. Removendo...")
                     del peer.active_peers[peer_name]

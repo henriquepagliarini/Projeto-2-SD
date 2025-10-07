@@ -68,8 +68,14 @@ class Peer:
     def request_resource(self, requester_timestamp, requester_peer_name):
         return self.critical_section.request_resource(requester_timestamp, requester_peer_name)
 
-    def receive_reply(self, receiving_from_peer_name):
-        return self.critical_section.receive_reply(receiving_from_peer_name)
+    def receive_permission(self, receiving_from_peer_name):
+        return self.critical_section.receive_permission(receiving_from_peer_name)
+
+    def remove_inactive_peer(self, inactive_peer):
+        with self.heartbeat_lock:
+            if inactive_peer in self.active_peers:
+                del self.active_peers[inactive_peer]
+                utils.log(self.name, f"Peer {inactive_peer} inativo removido da lista.")
 
 def start_peer(name):
     ns = nameserver.start_nameserver()
