@@ -28,10 +28,7 @@ def heartbeat_monitor(peer):
                 last_heartbeat = peer.active_peers[peer_name]
                 if now - last_heartbeat > HEARTBEAT_TIMEOUT:
                     utils.log(peer.name, f"Peer {peer_name} parece inativo. Removendo...")
-                    del peer.active_peers[peer_name]
-                    with peer.critical_section.lock:
-                        if peer_name in peer.critical_section.deferred_replies:
-                            peer.critical_section.deferred_replies.remove(peer_name)
+                    peer.remove_inactive_peer(peer_name)
                     utils.log(peer.name, f"Peer {peer_name} removido.")
         time.sleep(2)
 

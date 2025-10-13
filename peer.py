@@ -72,10 +72,13 @@ class Peer:
         return self.critical_section.receive_permission(receiving_from_peer_name)
 
     def remove_inactive_peer(self, inactive_peer):
-        with self.heartbeat_lock:
-            if inactive_peer in self.active_peers:
-                del self.active_peers[inactive_peer]
-                utils.log(self.name, f"Peer {inactive_peer} inativo removido da lista.")
+        if inactive_peer in self.active_peers:
+            del self.active_peers[inactive_peer]
+            with self.critical_section.lock:
+                if inactive_peer in self.critical_section.deferred_replies:
+                    self.critical_section.deferred_replies.remove(inactive_peer)
+                if inactive_peer in self.critical_section.permission_granted.keys():
+                    del self.critical_section.permission_granted[inactive_peer]
 
 def start_peer(name):
     ns = nameserver.start_nameserver()
@@ -101,15 +104,9 @@ def start_peer(name):
 
         match option:
             case '1':
-                if peer.critical_section.enter_critical_section():
-                    utils.log(name, f"Entrou na seção crítica.")
-                else:
-                    utils.log(name, f"Não conseguiu entrar na seção crítica.")
+                peer.critical_section.enter_critical_section()
             case '2':
-                if peer.critical_section.exit_critical_section():
-                    utils.log(name, f"Saiu da seção crítica.")
-                else:
-                    utils.log(name, f"Não conseguiu sair da seção crítica.")
+                peer.critical_section.exit_critical_section()
             case '3':
                 print(f"\nPeers ativos:\n{peer.get_active_peers()}")
                 print(f"Testando conectividade...")

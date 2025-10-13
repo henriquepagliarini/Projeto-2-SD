@@ -16,7 +16,6 @@ class CriticalSection:
         self.request_event = threading.Event()
 
         self.lock = threading.Lock()
-        self.MAX_WAIT_TIME = 15
         self.MAX_ACCESS_TIME = 8
 
     def increment_timestamp(self):
@@ -51,9 +50,6 @@ class CriticalSection:
                 self.permission_granted[receiving_from_peer_name] = True
                 utils.log(self.peer.name, f"Permissão adiada de {receiving_from_peer_name} recebida.")
 
-                if all(self.permission_granted.values()):
-                    self.request_event.set()
-
     def send_request_notification(self, request_timestamp, active_peer_name):
         try:
             with Pyro5.api.Proxy(f"PYRONAME:{active_peer_name}") as other_peer:
@@ -67,9 +63,6 @@ class CriticalSection:
                         utils.log(self.peer.name, f"{active_peer_name} negou.")
 
                     self.permission_granted[active_peer_name] = permission_granted
-
-                    if all(self.permission_granted.values()):
-                        self.request_event.set()
         except Exception as e:
             utils.log(self.peer.name, f"Erro ao requisitar {active_peer_name}: {e}")
             with self.lock:
@@ -92,7 +85,7 @@ class CriticalSection:
             with self.lock:
                 if self.state == State.HELD:
                     utils.log(self.peer.name, "Já está na seção crítica.")
-                    return True
+                    return
 
                 self.state = State.WANTED
                 self.request_event.clear()
@@ -109,27 +102,24 @@ class CriticalSection:
                 ).start()
 
             utils.log(self.peer.name, f"Aguardando {self.peer.get_peers_count()} respostas...")
-            self.request_event.wait(timeout=self.MAX_WAIT_TIME)
 
+            while self.state == State.WANTED:
+                self.request_event.wait(timeout=3)
+                with self.lock:
+                    if all(self.permission_granted.values()):
+                        self.request_event.set()
+                        break
+            
             with self.lock:
-                if all(self.permission_granted.values()):
-                    self.state = State.HELD
+                self.state = State.HELD
 
-                    timer = threading.Timer(self.MAX_ACCESS_TIME, self.exit_critical_section)
-                    timer.daemon = True
-                    timer.start()
-                    return True
-                else:
-                    inactive_peers = [k for k, v, in self.permission_granted.items() if v is None]
-                    if inactive_peers:
-                        utils.log(self.peer.name, f"Timeout aguardando respostas de: {inactive_peers}")
-                        for peer_name in inactive_peers:
-                            self.peer.remove_inactive_peer(peer_name)
-                    utils.log(self.peer.name, "Timeout ao obter todas as respostas. Liberando peers em espera.")
-                    self.state = State.RELEASED
-                    return False
+                timer = threading.Timer(self.MAX_ACCESS_TIME, self.exit_critical_section)
+                timer.daemon = True
+                timer.start()
+                utils.log(self.peer.name, "Todas as permissões recebidas. Entrando na seção crítica.")
         except Exception as e:
             utils.log(self.peer.name, f"Erro ao entrar na seção crítica: {e}")
+            self.state = State.RELEASED
         finally:
             self.request_timestamp = None
             self.permission_granted.clear()
@@ -138,10 +128,9 @@ class CriticalSection:
         with self.lock:
             if self.state != State.HELD:
                 utils.log(self.peer.name, "Não está na seção crítica.")
-                return False
+                return
 
             utils.log(self.peer.name, "Liberando recurso...")
             self.state = State.RELEASED
             if self.deferred_replies:
                 self.send_release_notification()
-            return True
